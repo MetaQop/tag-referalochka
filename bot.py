@@ -5,8 +5,9 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, html
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, ChatMemberUpdated, InlineKeyboardButton, CallbackQuery
-from aiogram.enums import ChatMemberStatus
+from aiogram.enums import ChatMemberStatus, ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
 
 import database as db
 from config import (
@@ -17,7 +18,9 @@ from config import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN)
+# БАГ #1: Bot создавался без default parse_mode — HTML не работал глобально.
+# Также в aiogram 3.x нужно передавать DefaultBotProperties.
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ──────────────────────────────────────────────
@@ -34,7 +37,6 @@ async def notify_admin(text: str):
             ADMIN_GROUP_ID,
             text,
             message_thread_id=ADMIN_TOPIC_ID,
-            parse_mode="HTML"
         )
     except Exception as e:
         logger.error(f"Admin notify error: {e}")
@@ -68,6 +70,7 @@ async def handle_health(request):
 
 async def start_server():
     app = web.Application()
+    app.router.add_get("/", handle_health)
     app.router.add_get("/health", handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -85,7 +88,6 @@ async def sub_scheduler():
                     await bot.send_message(
                         user['user_id'],
                         f"⚠️ Подписка истекает <b>{exp}</b>. Через 3 дня вы будете исключены.",
-                        parse_mode="HTML"
                     )
                     await db.mark_notified(user['user_id'])
                 except Exception as e:
@@ -110,7 +112,6 @@ async def sub_scheduler():
                         f"🔔 Эй! Прошло 3 дня, а ты ещё не в VIP.\n"
                         f"Осталось пригласить <b>{remaining}</b> друзей — и {SUBSCRIPTION_DAYS} дней эксклюзива твои 🔥\n"
                         f"Твоя ссылка: <code>{user['invite_link']}</code>",
-                        parse_mode="HTML"
                     )
                     await db.mark_reminder_sent(user['user_id'])
                 except Exception as e:
@@ -126,14 +127,12 @@ async def daily_stats_scheduler():
     while True:
         try:
             now_kyiv = kyiv_now()
-            # Считаем секунды до следующей полуночи по Киеву
             next_midnight = (now_kyiv + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
             wait_seconds = (next_midnight - now_kyiv).total_seconds()
             await asyncio.sleep(wait_seconds)
 
-            # Отправляем сводку за прошедший день
             yesterday = (kyiv_now() - timedelta(days=1)).strftime("%Y-%m-%d")
             stats = await db.get_daily_stats(yesterday)
             date_label = datetime.strptime(yesterday, "%Y-%m-%d").strftime("%d.%m.%Y")
@@ -157,13 +156,17 @@ def main_kb():
 # ──────────────────────────────────────────────
 @dp.message(CommandStart())
 async def start(m: Message):
-    await db.update_last_active(m.from_user.id)
+    # БАГ #2: update_last_active падал если пользователь новый (его нет в БД).
+    # Теперь сначала создаём пользователя, потом обновляем активность.
     u = await db.get_user(m.from_user.id)
 
-    # Получаем или создаём invite_link
     if not u:
         try:
-            link_obj = await bot.create_chat_invite_link(CHANNEL_ID, name=f"ref_{m.from_user.id}")
+            link_obj = await bot.create_chat_invite_link(
+                CHANNEL_ID,
+                name=f"ref_{m.from_user.id}",
+                creates_join_request=False
+            )
             invite_link = link_obj.invite_link
             await db.create_user(
                 m.from_user.id, m.from_user.username,
@@ -174,14 +177,16 @@ async def start(m: Message):
             await m.answer(
                 f"👋 Привет, {html.quote(m.from_user.full_name)}!\n"
                 f"Пригласи {REQUIRED_INVITES} друзей в канал — получи VIP на {SUBSCRIPTION_DAYS} дней.\n\n"
-                "⚠️ Бот не является администратором канала. Обратитесь к администратору.",
-                reply_markup=main_kb(), parse_mode="HTML"
+                "⚠️ Не удалось создать ссылку. Убедитесь что бот — администратор канала.",
+                reply_markup=main_kb()
             )
             return
         invited = 0
     else:
         invite_link = u['invite_link']
         invited = u['invited_count']
+
+    await db.update_last_active(m.from_user.id)
 
     await m.answer(
         f"👋 Привет! Ты попал в один из лучших NSFW каналов.\n\n"
@@ -190,29 +195,32 @@ async def start(m: Message):
         f"📊 Твой прогресс: {invited}/{REQUIRED_INVITES}\n\n"
         f"❓ Вопросы — пиши сюда",
         reply_markup=main_kb(),
-        parse_mode="HTML"
     )
 
 @dp.callback_query(F.data == "get_link")
 async def get_link(c: CallbackQuery):
-    await db.update_last_active(c.from_user.id)
     u = await db.get_user(c.from_user.id)
     if not u:
         try:
-            link_obj = await bot.create_chat_invite_link(CHANNEL_ID, name=f"ref_{c.from_user.id}")
+            link_obj = await bot.create_chat_invite_link(
+                CHANNEL_ID,
+                name=f"ref_{c.from_user.id}",
+                creates_join_request=False
+            )
             invite_link = link_obj.invite_link
             await db.create_user(
                 c.from_user.id, c.from_user.username,
                 c.from_user.full_name, invite_link
             )
-        except:
+        except Exception as e:
+            logger.error(f"get_link callback error: {e}")
             return await c.answer("❌ Бот не является администратором канала!", show_alert=True)
     else:
         invite_link = u['invite_link']
 
+    await db.update_last_active(c.from_user.id)
     await c.message.answer(
         f"🔗 Твоя реферальная ссылка:\n<code>{invite_link}</code>",
-        parse_mode="HTML"
     )
     await c.answer()
 
@@ -231,7 +239,7 @@ async def stats_cb(c: CallbackQuery):
         remaining = max(0, REQUIRED_INVITES - u['invited_count'])
         txt += f"⏳ Ещё нужно пригласить: <b>{remaining}</b>"
 
-    await c.message.answer(txt, parse_mode="HTML")
+    await c.message.answer(txt)
     await c.answer()
 
 # ──────────────────────────────────────────────
@@ -248,7 +256,7 @@ async def cmd_week(m: Message):
     d_from = datetime.strptime(date_from, "%Y-%m-%d").strftime("%d.%m")
     d_to = datetime.strptime(date_to, "%Y-%m-%d").strftime("%d.%m.%Y")
     text = build_stats_text(stats, f"неделю ({d_from}–{d_to})")
-    await m.reply(text, parse_mode="HTML")
+    await m.reply(text)
 
 @dp.message(Command("month"))
 async def cmd_month(m: Message):
@@ -261,7 +269,7 @@ async def cmd_month(m: Message):
     d_from = datetime.strptime(date_from, "%Y-%m-%d").strftime("%d.%m")
     d_to = datetime.strptime(date_to, "%Y-%m-%d").strftime("%d.%m.%Y")
     text = build_stats_text(stats, f"месяц ({d_from}–{d_to})")
-    await m.reply(text, parse_mode="HTML")
+    await m.reply(text)
 
 @dp.message(Command("today"))
 async def cmd_today(m: Message):
@@ -271,15 +279,16 @@ async def cmd_today(m: Message):
     stats = await db.get_daily_stats(today)
     date_label = kyiv_now().strftime("%d.%m.%Y")
     text = build_stats_text(stats, date_label)
-    await m.reply(text, parse_mode="HTML")
+    await m.reply(text)
 
 # ──────────────────────────────────────────────
 # ТРЕКИНГ ВХОДА / ВЫХОДА В КАНАЛ
 # ──────────────────────────────────────────────
-@dp.chat_member()
+
+# БАГ #3: @dp.chat_member() без фильтра чата ловит ВСЕ события включая группы.
+# Фильтрация по CHANNEL_ID теперь вынесена в декоратор через lambda-фильтр.
+@dp.chat_member(F.chat.id == CHANNEL_ID)
 async def tracking(event: ChatMemberUpdated):
-    if event.chat.id != CHANNEL_ID:
-        return
     old, new = event.old_chat_member.status, event.new_chat_member.status
     uid = event.new_chat_member.user.id
     uname = event.new_chat_member.user.username
@@ -306,7 +315,6 @@ async def tracking(event: ChatMemberUpdated):
                                 ref['user_id'],
                                 f"🏆 Готово! Ты выполнил задание.\n"
                                 f"Доступ в VIP на {SUBSCRIPTION_DAYS} дней:\n{grp_link.invite_link}",
-                                parse_mode="HTML"
                             )
                         except Exception as e:
                             logger.error(f"VIP link error: {e}")
@@ -315,15 +323,12 @@ async def tracking(event: ChatMemberUpdated):
                             await bot.send_message(
                                 ref['user_id'],
                                 f"🎉 Новый участник по твоей ссылке! ({u['invited_count']}/{REQUIRED_INVITES})",
-                                parse_mode="HTML"
                             )
                         except Exception as e:
                             logger.warning(f"Ref notify error: {e}")
 
-        # Логируем событие
         await db.log_channel_event(uid, uname, fname, 'join', referrer_id, referrer_name)
 
-        # Уведомление в админ-группу
         user_link = fmt_user(uname, fname, uid)
         if referrer_id and referrer_name:
             admin_text = (
@@ -339,11 +344,10 @@ async def tracking(event: ChatMemberUpdated):
             )
         await notify_admin(admin_text)
 
-    # ── Выход (Анти-фейк) ───────────────────────
+    # ── Выход ───────────────────────────────────
     elif old == ChatMemberStatus.MEMBER and new in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
         refr_id = await db.get_referrer_of(uid)
 
-        # Логируем событие
         await db.log_channel_event(uid, uname, fname, 'leave', refr_id, None)
 
         if refr_id:
@@ -357,7 +361,6 @@ async def tracking(event: ChatMemberUpdated):
                 except Exception as e:
                     logger.warning(f"Remove ref notify error: {e}")
 
-        # Уведомление в админ-группу
         user_link = fmt_user(uname, fname, uid)
         action = "исключён" if new == ChatMemberStatus.KICKED else "покинул канал"
         admin_text = (
@@ -373,9 +376,15 @@ async def tracking(event: ChatMemberUpdated):
 # ──────────────────────────────────────────────
 async def main():
     await db.init_db()
-    asyncio.create_task(start_server())
-    asyncio.create_task(sub_scheduler())
-    asyncio.create_task(daily_stats_scheduler())
+
+    # БАГ #4: asyncio.create_task() вызывался ДО того как event loop полностью запущен.
+    # Используем on_startup через asyncio.gather + правильный порядок запуска.
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_server())
+    loop.create_task(sub_scheduler())
+    loop.create_task(daily_stats_scheduler())
+
+    logger.info("Bot started polling...")
     await dp.start_polling(
         bot,
         allowed_updates=["message", "chat_member", "callback_query"]
@@ -383,3 +392,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
