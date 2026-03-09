@@ -1,0 +1,29 @@
+services:
+  - type: worker
+    name: referral-bot
+    env: python
+    pythonVersion: "3.11.9"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: GROUP_ID
+        sync: false
+      - key: ADMIN_GROUP_ID
+        value: "-1003506963583"
+      - key: ADMIN_TOPIC_ID
+        value: "412"
+      - key: REQUIRED_INVITES
+        value: "4"
+      - key: SUBSCRIPTION_DAYS
+        value: "21"
+      - key: DB_PATH
+        value: "/data/referral_bot.db"
+      - key: PORT
+        value: "8080"
+    disk:
+      name: bot-data
+      mountPath: /data
