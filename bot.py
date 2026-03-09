@@ -18,20 +18,19 @@ from config import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# БАГ #1: Bot создавался без default parse_mode — HTML не работал глобально.
-# Также в aiogram 3.x нужно передавать DefaultBotProperties.
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+# Ссылка на тему с вопросами в админ-группе
+SUPPORT_TOPIC_LINK = "https://t.me/c/3506963583/434"
 
 # ──────────────────────────────────────────────
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ──────────────────────────────────────────────
 def kyiv_now() -> datetime:
-    """Текущее время по Киеву (UTC+3)."""
     return datetime.now(timezone.utc) + timedelta(hours=3)
 
 async def notify_admin(text: str):
-    """Отправить сообщение в тему (топик) админской группы."""
     try:
         await bot.send_message(
             ADMIN_GROUP_ID,
@@ -63,6 +62,23 @@ def build_stats_text(stats: dict, period_label: str) -> str:
     return "\n".join(lines)
 
 # ──────────────────────────────────────────────
+# КЛАВИАТУРЫ
+# ──────────────────────────────────────────────
+def main_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="get_link"))
+    builder.row(InlineKeyboardButton(text="📊 Мой прогресс", callback_data="stats"))
+    builder.row(InlineKeyboardButton(text="❓ Задать вопрос", url=SUPPORT_TOPIC_LINK))
+    return builder.as_markup()
+
+def welcome_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🎁 Получить VIP", callback_data="get_link"))
+    builder.row(InlineKeyboardButton(text="📊 Мой прогресс", callback_data="stats"))
+    builder.row(InlineKeyboardButton(text="❓ Задать вопрос", url=SUPPORT_TOPIC_LINK))
+    return builder.as_markup()
+
+# ──────────────────────────────────────────────
 # СЕРВЕР И ПЛАНИРОВЩИК
 # ──────────────────────────────────────────────
 async def handle_health(request):
@@ -78,10 +94,8 @@ async def start_server():
     logger.info(f"Health server started on port {PORT}")
 
 async def sub_scheduler():
-    """Каждый час: уведомления об истечении, кик просроченных, ремайндеры."""
     while True:
         try:
-            # Предупреждение за 3 дня
             for user in await db.get_users_to_notify(3):
                 exp = datetime.fromisoformat(user['expiry_date']).strftime("%d.%m.%Y")
                 try:
@@ -93,7 +107,6 @@ async def sub_scheduler():
                 except Exception as e:
                     logger.warning(f"Notify error {user['user_id']}: {e}")
 
-            # Кик просроченных
             for uid in await db.get_expired_users():
                 try:
                     await bot.ban_chat_member(GROUP_ID, uid)
@@ -103,7 +116,6 @@ async def sub_scheduler():
                 except Exception as e:
                     logger.error(f"Kick error {uid}: {e}")
 
-            # Ремайндеры неактивным (3 дня бездействия)
             for user in await db.get_inactive_users_to_remind(3):
                 remaining = max(0, REQUIRED_INVITES - user['invited_count'])
                 try:
@@ -123,7 +135,6 @@ async def sub_scheduler():
         await asyncio.sleep(3600)
 
 async def daily_stats_scheduler():
-    """Каждый день в 00:00 по Киеву отправляет сводку в админ-группу."""
     while True:
         try:
             now_kyiv = kyiv_now()
@@ -143,21 +154,10 @@ async def daily_stats_scheduler():
             await asyncio.sleep(60)
 
 # ──────────────────────────────────────────────
-# КЛАВИАТУРА
-# ──────────────────────────────────────────────
-def main_kb():
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="get_link"))
-    builder.row(InlineKeyboardButton(text="📊 Мой прогресс", callback_data="stats"))
-    return builder.as_markup()
-
-# ──────────────────────────────────────────────
 # ХЭНДЛЕРЫ БОТА
 # ──────────────────────────────────────────────
 @dp.message(CommandStart())
 async def start(m: Message):
-    # БАГ #2: update_last_active падал если пользователь новый (его нет в БД).
-    # Теперь сначала создаём пользователя, потом обновляем активность.
     u = await db.get_user(m.from_user.id)
 
     if not u:
@@ -193,7 +193,7 @@ async def start(m: Message):
         f"🎁 Хочешь VIP? Пригласи {REQUIRED_INVITES} друга → получаешь VIP на {SUBSCRIPTION_DAYS} дней\n\n"
         f"Твоя ссылка: <code>{invite_link}</code>\n\n"
         f"📊 Твой прогресс: {invited}/{REQUIRED_INVITES}\n\n"
-        f"❓ Вопросы — пиши сюда",
+        f"❓ Вопросы — нажми кнопку ниже",
         reply_markup=main_kb(),
     )
 
@@ -243,7 +243,7 @@ async def stats_cb(c: CallbackQuery):
     await c.answer()
 
 # ──────────────────────────────────────────────
-# КОМАНДЫ АНАЛИТИКИ (только в группе)
+# КОМАНДЫ АНАЛИТИКИ (только в админ-группе)
 # ──────────────────────────────────────────────
 @dp.message(Command("week"))
 async def cmd_week(m: Message):
@@ -284,9 +284,6 @@ async def cmd_today(m: Message):
 # ──────────────────────────────────────────────
 # ТРЕКИНГ ВХОДА / ВЫХОДА В КАНАЛ
 # ──────────────────────────────────────────────
-
-# БАГ #3: @dp.chat_member() без фильтра чата ловит ВСЕ события включая группы.
-# Фильтрация по CHANNEL_ID теперь вынесена в декоратор через lambda-фильтр.
 @dp.chat_member(F.chat.id == CHANNEL_ID)
 async def tracking(event: ChatMemberUpdated):
     old, new = event.old_chat_member.status, event.new_chat_member.status
@@ -329,6 +326,46 @@ async def tracking(event: ChatMemberUpdated):
 
         await db.log_channel_event(uid, uname, fname, 'join', referrer_id, referrer_name)
 
+        # ── Приветственное сообщение новому участнику ──
+        try:
+            user_db = await db.get_user(uid)
+            if not user_db:
+                try:
+                    link_obj = await bot.create_chat_invite_link(
+                        CHANNEL_ID,
+                        name=f"ref_{uid}",
+                        creates_join_request=False
+                    )
+                    invite_link = link_obj.invite_link
+                    await db.create_user(uid, uname, fname, invite_link)
+                except Exception as e:
+                    logger.error(f"Welcome: create invite link error for {uid}: {e}")
+                    invite_link = None
+            else:
+                invite_link = user_db.get('invite_link')
+
+            if invite_link:
+                welcome_text = (
+                    f"👋 Привет, {html.quote(fname or 'друг')}! Ты попал в один из лучших NSFW каналов.\n\n"
+                    f"🎁 Хочешь VIP? Пригласи <b>{REQUIRED_INVITES}</b> друга → получаешь VIP на <b>{SUBSCRIPTION_DAYS} дней</b>\n\n"
+                    f"Твоя реферальная ссылка:\n<code>{invite_link}</code>\n\n"
+                    f"📊 Твой прогресс: 0/{REQUIRED_INVITES}\n\n"
+                    f"❓ Есть вопросы? Нажми кнопку ниже — ответим!"
+                )
+            else:
+                welcome_text = (
+                    f"👋 Привет, {html.quote(fname or 'друг')}! Ты попал в один из лучших NSFW каналов.\n\n"
+                    f"🎁 Хочешь VIP? Пригласи <b>{REQUIRED_INVITES}</b> друга → получаешь VIP на <b>{SUBSCRIPTION_DAYS} дней</b>\n\n"
+                    f"Напиши /start боту чтобы получить реферальную ссылку.\n\n"
+                    f"❓ Есть вопросы? Нажми кнопку ниже — ответим!"
+                )
+
+            await bot.send_message(uid, welcome_text, reply_markup=welcome_kb())
+        except Exception as e:
+            # Пользователь мог заблокировать бота — это нормально
+            logger.warning(f"Welcome message failed for {uid}: {e}")
+
+        # ── Уведомление в админ-группу ──
         user_link = fmt_user(uname, fname, uid)
         if referrer_id and referrer_name:
             admin_text = (
@@ -377,8 +414,6 @@ async def tracking(event: ChatMemberUpdated):
 async def main():
     await db.init_db()
 
-    # БАГ #4: asyncio.create_task() вызывался ДО того как event loop полностью запущен.
-    # Используем on_startup через asyncio.gather + правильный порядок запуска.
     loop = asyncio.get_event_loop()
     loop.create_task(start_server())
     loop.create_task(sub_scheduler())
@@ -392,4 +427,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
