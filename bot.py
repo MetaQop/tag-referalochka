@@ -8,6 +8,9 @@ from aiogram.types import Message, ChatMemberUpdated, InlineKeyboardButton, Call
 from aiogram.enums import ChatMemberStatus, ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
 import database as db
 from config import (
@@ -19,10 +22,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
-# Ссылка на тему с вопросами в админ-группе
-SUPPORT_TOPIC_LINK = "https://t.me/c/3506963583/434"
+# ID темы для вопросов от пользователей
+SUPPORT_TOPIC_ID = 434
+
+# ──────────────────────────────────────────────
+# FSM — состояние ожидания вопроса
+# ──────────────────────────────────────────────
+class AskQuestion(StatesGroup):
+    waiting_for_question = State()
 
 # ──────────────────────────────────────────────
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -68,14 +77,12 @@ def main_kb():
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="get_link"))
     builder.row(InlineKeyboardButton(text="📊 Мой прогресс", callback_data="stats"))
-    builder.row(InlineKeyboardButton(text="❓ Задать вопрос", url=SUPPORT_TOPIC_LINK))
+    builder.row(InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question"))
     return builder.as_markup()
 
-def welcome_kb():
+def cancel_kb():
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🎁 Получить VIP", callback_data="get_link"))
-    builder.row(InlineKeyboardButton(text="📊 Мой прогресс", callback_data="stats"))
-    builder.row(InlineKeyboardButton(text="❓ Задать вопрос", url=SUPPORT_TOPIC_LINK))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_question"))
     return builder.as_markup()
 
 # ──────────────────────────────────────────────
@@ -154,10 +161,11 @@ async def daily_stats_scheduler():
             await asyncio.sleep(60)
 
 # ──────────────────────────────────────────────
-# ХЭНДЛЕРЫ БОТА
+# ХЭНДЛЕРЫ — /start
 # ──────────────────────────────────────────────
 @dp.message(CommandStart())
-async def start(m: Message):
+async def start(m: Message, state: FSMContext):
+    await state.clear()
     u = await db.get_user(m.from_user.id)
 
     if not u:
@@ -197,8 +205,12 @@ async def start(m: Message):
         reply_markup=main_kb(),
     )
 
+# ──────────────────────────────────────────────
+# ХЭНДЛЕРЫ — кнопки
+# ──────────────────────────────────────────────
 @dp.callback_query(F.data == "get_link")
-async def get_link(c: CallbackQuery):
+async def get_link(c: CallbackQuery, state: FSMContext):
+    await state.clear()
     u = await db.get_user(c.from_user.id)
     if not u:
         try:
@@ -219,13 +231,12 @@ async def get_link(c: CallbackQuery):
         invite_link = u['invite_link']
 
     await db.update_last_active(c.from_user.id)
-    await c.message.answer(
-        f"🔗 Твоя реферальная ссылка:\n<code>{invite_link}</code>",
-    )
+    await c.message.answer(f"🔗 Твоя реферальная ссылка:\n<code>{invite_link}</code>")
     await c.answer()
 
 @dp.callback_query(F.data == "stats")
-async def stats_cb(c: CallbackQuery):
+async def stats_cb(c: CallbackQuery, state: FSMContext):
+    await state.clear()
     await db.update_last_active(c.from_user.id)
     u = await db.get_user(c.from_user.id)
     if not u:
@@ -241,6 +252,60 @@ async def stats_cb(c: CallbackQuery):
 
     await c.message.answer(txt)
     await c.answer()
+
+# ──────────────────────────────────────────────
+# ХЭНДЛЕРЫ — вопрос администраторам
+# ──────────────────────────────────────────────
+@dp.callback_query(F.data == "ask_question")
+async def ask_question_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AskQuestion.waiting_for_question)
+    await c.message.answer(
+        "✍️ Напиши свой вопрос — и мы передадим его администраторам.\n\n"
+        "Можно написать текст, отправить фото или видео.",
+        reply_markup=cancel_kb()
+    )
+    await c.answer()
+
+@dp.callback_query(F.data == "cancel_question")
+async def cancel_question(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.answer("Отменено. Возвращайся если будут вопросы 👍", reply_markup=main_kb())
+    await c.answer()
+
+@dp.message(AskQuestion.waiting_for_question)
+async def receive_question(m: Message, state: FSMContext):
+    await state.clear()
+
+    user = m.from_user
+    name = html.quote(user.full_name or "")
+    username_str = f" (@{user.username})" if user.username else ""
+    header = (
+        f"❓ <b>Вопрос от пользователя</b>\n"
+        f"👤 <a href='tg://user?id={user.id}'>{name}</a>{username_str}\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"─────────────────"
+    )
+
+    try:
+        # Отправляем заголовок с инфо о пользователе
+        await bot.send_message(
+            ADMIN_GROUP_ID,
+            header,
+            message_thread_id=SUPPORT_TOPIC_ID,
+        )
+        # Пересылаем само сообщение (текст, фото, видео, голос — всё что угодно)
+        await m.forward(chat_id=ADMIN_GROUP_ID, message_thread_id=SUPPORT_TOPIC_ID)
+
+        await m.answer(
+            "✅ Вопрос отправлен! Администраторы ответят вам в ближайшее время.",
+            reply_markup=main_kb()
+        )
+    except Exception as e:
+        logger.error(f"Forward question error from {user.id}: {e}")
+        await m.answer(
+            "❌ Не удалось отправить вопрос. Попробуйте позже.",
+            reply_markup=main_kb()
+        )
 
 # ──────────────────────────────────────────────
 # КОМАНДЫ АНАЛИТИКИ (только в админ-группе)
@@ -360,9 +425,8 @@ async def tracking(event: ChatMemberUpdated):
                     f"❓ Есть вопросы? Нажми кнопку ниже — ответим!"
                 )
 
-            await bot.send_message(uid, welcome_text, reply_markup=welcome_kb())
+            await bot.send_message(uid, welcome_text, reply_markup=main_kb())
         except Exception as e:
-            # Пользователь мог заблокировать бота — это нормально
             logger.warning(f"Welcome message failed for {uid}: {e}")
 
         # ── Уведомление в админ-группу ──
