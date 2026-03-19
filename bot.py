@@ -216,7 +216,7 @@ async def start(m: Message, state: FSMContext):
             link_obj = await bot.create_chat_invite_link(
                 CHANNEL_ID,
                 name=f"ref_{m.from_user.id}",
-                creates_join_request=False
+                creates_join_request=True
             )
             invite_link = link_obj.invite_link
             await db.create_user(
@@ -260,7 +260,7 @@ async def get_link(c: CallbackQuery, state: FSMContext):
             link_obj = await bot.create_chat_invite_link(
                 CHANNEL_ID,
                 name=f"ref_{c.from_user.id}",
-                creates_join_request=False
+                creates_join_request=True
             )
             invite_link = link_obj.invite_link
             await db.create_user(
@@ -364,9 +364,12 @@ async def handle_join_request(request: ChatJoinRequest, state: FSMContext):
     # Сохраняем заявку в базу
     await db.save_join_request(uid, uname, fname)
 
-    # Сохраняем user_id заявителя в FSM чтобы потом одобрить/отклонить
+    # Достаём реферальную ссылку из заявки
+    ref_invite_link = request.invite_link.invite_link if request.invite_link else None
+
+    # Сохраняем данные в FSM
     user_state = dp.fsm.resolve_context(bot, uid, uid)
-    await user_state.update_data(join_request_chat_id=CHANNEL_ID)
+    await user_state.update_data(join_request_chat_id=CHANNEL_ID, ref_invite_link=ref_invite_link)
     await user_state.set_state(JoinRequest.q1_age)
 
     try:
@@ -481,6 +484,7 @@ async def join_rules_decline(c: CallbackQuery, state: FSMContext):
 async def join_rules_agree(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     source = data.get("source", "—")
+    ref_invite_link = data.get("ref_invite_link")
     await state.clear()
 
     uid = c.from_user.id
@@ -495,6 +499,34 @@ async def join_rules_agree(c: CallbackQuery, state: FSMContext):
         await c.message.edit_text("❌ Ошибка при одобрении заявки. Напиши администратору.")
         await c.answer()
         return
+
+    # ── Засчитываем реферала если пришёл по реф-ссылке ──
+    referrer_id = None
+    if ref_invite_link:
+        ref = await db.get_user_by_invite_link(ref_invite_link)
+        if ref and uid != ref['user_id']:
+            referrer_id = ref['user_id']
+            if await db.add_referral(ref['user_id'], uid):
+                u = await db.get_user(ref['user_id'])
+                if u['invited_count'] >= REQUIRED_INVITES and not u['completed']:
+                    await db.set_expiry(ref['user_id'], SUBSCRIPTION_DAYS)
+                    try:
+                        grp_link = await bot.create_chat_invite_link(GROUP_ID, member_limit=1)
+                        await bot.send_message(
+                            ref['user_id'],
+                            f"🏆 Готово! Ты выполнил задание.\n"
+                            f"Доступ в VIP на {SUBSCRIPTION_DAYS} дней:\n{grp_link.invite_link}",
+                        )
+                    except Exception as e:
+                        logger.error(f"VIP link error: {e}")
+                else:
+                    try:
+                        await bot.send_message(
+                            ref['user_id'],
+                            f"🎉 Новый участник по твоей ссылке! ({u['invited_count']}/{REQUIRED_INVITES})",
+                        )
+                    except Exception as e:
+                        logger.warning(f"Ref notify error: {e}")
 
     await c.message.edit_text(
         "🎉 <b>Заявка одобрена!</b>\n\n"
@@ -564,36 +596,14 @@ async def tracking(event: ChatMemberUpdated):
 
     # ── Вступление ──────────────────────────────
     if old in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED) and new == ChatMemberStatus.MEMBER:
-        referrer_id = None
+        # Реферал засчитывается при одобрении заявки (handle_join_request → join_rules_agree)
+        # Здесь только логируем событие
+        referrer_id = await db.get_referrer_of(uid)
         referrer_name = None
-
-        if event.invite_link:
-            ref = await db.get_user_by_invite_link(event.invite_link.invite_link)
-            if ref and uid != ref['user_id']:
-                referrer_id = ref['user_id']
-                referrer_name = ref.get('full_name') or ref.get('username') or str(ref['user_id'])
-
-                if await db.add_referral(ref['user_id'], uid):
-                    u = await db.get_user(ref['user_id'])
-                    if u['invited_count'] >= REQUIRED_INVITES and not u['completed']:
-                        await db.set_expiry(ref['user_id'], SUBSCRIPTION_DAYS)
-                        try:
-                            grp_link = await bot.create_chat_invite_link(GROUP_ID, member_limit=1)
-                            await bot.send_message(
-                                ref['user_id'],
-                                f"🏆 Готово! Ты выполнил задание.\n"
-                                f"Доступ в VIP на {SUBSCRIPTION_DAYS} дней:\n{grp_link.invite_link}",
-                            )
-                        except Exception as e:
-                            logger.error(f"VIP link error: {e}")
-                    else:
-                        try:
-                            await bot.send_message(
-                                ref['user_id'],
-                                f"🎉 Новый участник по твоей ссылке! ({u['invited_count']}/{REQUIRED_INVITES})",
-                            )
-                        except Exception as e:
-                            logger.warning(f"Ref notify error: {e}")
+        if referrer_id:
+            ref = await db.get_user(referrer_id)
+            if ref:
+                referrer_name = ref.get('full_name') or ref.get('username') or str(referrer_id)
 
         await db.log_channel_event(uid, uname, fname, 'join', referrer_id, referrer_name)
 
@@ -605,7 +615,7 @@ async def tracking(event: ChatMemberUpdated):
                     link_obj = await bot.create_chat_invite_link(
                         CHANNEL_ID,
                         name=f"ref_{uid}",
-                        creates_join_request=False
+                        creates_join_request=True
                     )
                     invite_link = link_obj.invite_link
                     await db.create_user(uid, uname, fname, invite_link)
