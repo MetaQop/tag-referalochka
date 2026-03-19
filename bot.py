@@ -445,6 +445,11 @@ async def _go_to_q3(target, state: FSMContext, source="—"):
     else:
         await target.answer(text, reply_markup=agree_kb())
 
+# ── Q2: пропуск кнопкой ──────────────────────────────────────────────────────
+@dp.callback_query(JoinRequest.q2_source, F.data == "skip_source")
+async def join_source_skip(c: CallbackQuery, state: FSMContext):
+    await _go_to_q3(c, state, source="не указал")
+
 # ── Q2: источник (текстовый ответ) ──────────────────────────────────────────
 @dp.message(JoinRequest.q2_source)
 async def join_source_answer(m: Message, state: FSMContext):
